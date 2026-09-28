@@ -1,0 +1,31 @@
+{
+  "proxy_sources": [
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+    "https://raw.githubusercontent.com/Skillter/ProxyGather/refs/heads/master/proxies/working-proxies-http.txt",
+    "https://raw.githubusercontent.com/proxygenerator1/ProxyGenerator/main/MostStable/http.txt",
+    "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/http.txt",
+    "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/refs/heads/main/proxies/top-http.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt"
+  ],
+  "proxy_validation_timeout": 8,
+  "proxy_max_latency_seconds": 8.0,
+  "proxy_batch_size": 100,
+  "concurrent_downloads": 1,
+  "max_retries_per_video": 5,
+  "chunk_size_bytes": 99614720,
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "download_headers": {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  "temp_dir": "temp_downloads",
+  "valid_proxies_file": "valid_proxies.txt",
+  "urls_file": "urls.txt",
+  "no_preview_image_url": "https://raw.githubusercontent.com/zilch-fnoop-8842-krag/glorf-nibz-7724-xqpto-muv/refs/heads/flurbo-womplex-4491-zzyzx/assets/no_preview.jpg",
+  "no_avatar_image_url": "https://raw.githubusercontent.com/zilch-fnoop-8842-krag/glorf-nibz-7724-xqpto-muv/refs/heads/flurbo-womplex-4491-zzyzx/assets/no_avatar.png"
+}

@@ -1,0 +1,7 @@
+yt-dlp[default,curl-cffi]
+ffmpeg
+requests
+curl_cffi
+beautifulsoup4
+lxml
+phub[full]
