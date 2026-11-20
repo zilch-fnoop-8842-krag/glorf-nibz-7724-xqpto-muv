@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -28,12 +30,13 @@ const (
 	// DefaultMinSpeedBytesPerSec enforces >= 1.5 MB/s (1.5 MiB/s) download throughput.
 	DefaultMinSpeedBytesPerSec = 1.5 * 1024 * 1024
 
-	defaultValidationWorkers = 200
-	defaultValidationTimeout = 8 * time.Second
+	defaultValidationWorkers = 400
+	defaultValidationTimeout = 6 * time.Second
 	defaultMaxLatency        = 8 * time.Second
+	fastTCPDialTimeout       = 1500 * time.Millisecond
 	maxProbeReadBytes        = 4 * 1024 * 1024
 	targetSpeedSampleBytes   = int64(1.5 * 1024 * 1024)
-	minValidSampleBytes      = 256 * 1024
+	minValidSampleBytes      = 64 * 1024
 )
 
 // ProxySource defines a public proxy feed and the default protocol for bare IP:PORT entries.
@@ -60,6 +63,7 @@ var pornhubProbeTargets = []string{
 	"https://www.pornhub.com/",
 	"https://www.pornhub.com/video",
 	"https://www.pornhub.com/categories",
+	"https://www.pornhub.com/pornstars",
 }
 
 // ProxyConfig configures the proxy pool and validation thresholds.
@@ -76,6 +80,45 @@ type validatedProxy struct {
 	URL        string
 	SpeedBps   float64
 	LastTested time.Time
+}
+
+type validationStats struct {
+	tested      atomic.Int64
+	tcpOK       atomic.Int64
+	http200     atomic.Int64
+	cfOrInvalid atomic.Int64
+	tooSmall    atomic.Int64
+	tooSlow     atomic.Int64
+	passed      atomic.Int64
+	bestSpeed   atomic.Uint64 // float64 bits
+}
+
+func (s *validationStats) recordBestSpeed(bps float64) {
+	for {
+		oldBits := s.bestSpeed.Load()
+		oldVal := math.Float64frombits(oldBits)
+		if bps <= oldVal {
+			return
+		}
+		if s.bestSpeed.CompareAndSwap(oldBits, math.Float64bits(bps)) {
+			return
+		}
+	}
+}
+
+func (s *validationStats) snapshotString() string {
+	bestMBps := math.Float64frombits(s.bestSpeed.Load()) / (1024 * 1024)
+	return fmt.Sprintf(
+		"tested=%d | tcp_ok=%d | http_200=%d | cf_or_bad_html=%d | too_small=%d | too_slow=%d | passed=%d | best_speed=%.2f MB/s",
+		s.tested.Load(),
+		s.tcpOK.Load(),
+		s.http200.Load(),
+		s.cfOrInvalid.Load(),
+		s.tooSmall.Load(),
+		s.tooSlow.Load(),
+		s.passed.Load(),
+		bestMBps,
+	)
 }
 
 // ProxyManager is a thread-safe proxy pool that collects, validates against pornhub.com,
@@ -123,7 +166,6 @@ func NewProxyManager(cfg ProxyConfig) *ProxyManager {
 		validFile = "valid_proxies.txt"
 	}
 
-	// Aggregate DefaultProxySources (10 sources) + any extra configured sources without duplicates.
 	seenSources := make(map[string]struct{}, len(DefaultProxySources)+len(cfg.ExtraSources))
 	sources := make([]ProxySource, 0, len(DefaultProxySources)+len(cfg.ExtraSources))
 	for _, s := range DefaultProxySources {
@@ -165,26 +207,22 @@ func NewProxyManager(cfg ProxyConfig) *ProxyManager {
 	}
 }
 
-// Len returns the number of proxies currently queued for checkout.
 func (pm *ProxyManager) Len() int {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	return len(pm.queue)
 }
 
-// IsEmpty reports whether the active proxy queue has no available proxies.
 func (pm *ProxyManager) IsEmpty() bool {
 	return pm.Len() == 0
 }
 
-// VerifiedCount returns the number of currently verified working proxies.
 func (pm *ProxyManager) VerifiedCount() int {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	return len(pm.verified)
 }
 
-// GetProxy pops a verified proxy from the queue, blocking up to timeout if empty.
 func (pm *ProxyManager) GetProxy(ctx context.Context, timeout time.Duration) (string, bool) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -212,7 +250,6 @@ func (pm *ProxyManager) GetProxy(ctx context.Context, timeout time.Duration) (st
 	}
 }
 
-// ReportResult returns working proxies to the pool or evicts failed proxies from persistence.
 func (pm *ProxyManager) ReportResult(proxy string, success bool) {
 	if proxy == "" {
 		return
@@ -281,53 +318,117 @@ func (pm *ProxyManager) Replenish(ctx context.Context, required int) {
 
 		if len(persisted) > 0 {
 			log.Printf("INFO - Re-validating %d persisted proxies against pornhub.com...", len(persisted))
-			validPersisted := pm.validateBatch(ctx, persisted)
-			pm.enqueueValidated(validPersisted)
-			log.Printf("INFO - %d persisted proxies passed validation (>= %.2f MB/s).",
-				len(validPersisted), pm.minSpeedBytesPerSec/(1024*1024))
+			stats := &validationStats{}
+			pm.validateStream(ctx, persisted, 0, stats) // 0 = validate all persisted proxies
+			log.Printf("INFO - Persisted proxy check summary: %s", stats.snapshotString())
 		}
 	}
 
-	// 2. Collect from 10 online proxy sources and validate in batches if still short
 	if pm.Len() >= required {
 		return
 	}
 
-	candidates := pm.nextCandidateBatchPool(ctx)
+	// 2. Collect from 10 online sources and stream through continuous worker pool
+	candidates := pm.nextCandidatePool(ctx)
 	if len(candidates) == 0 {
 		log.Printf("WARNING - No untested proxy candidates remaining across sources.")
 		return
 	}
 
-	needed := required - pm.Len()
-	batchSize := max(needed*25, 400)
+	log.Printf("INFO - Streaming %d proxy candidates across %d workers (stopping at %d verified)...",
+		len(candidates), pm.workers, required)
 
-	for i := 0; i < len(candidates); i += batchSize {
-		if ctx.Err() != nil {
-			break
+	stats := &validationStats{}
+	pm.validateStream(ctx, candidates, required, stats)
+	log.Printf("INFO - Validation finished: %s (pool size: %d)", stats.snapshotString(), pm.Len())
+}
+
+// validateStream runs a barrier-free worker pool that stops immediately once pool size >= targetPoolSize.
+// If targetPoolSize <= 0, all candidates are validated.
+func (pm *ProxyManager) validateStream(ctx context.Context, candidates []string, targetPoolSize int, stats *validationStats) {
+	if len(candidates) == 0 {
+		return
+	}
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workerCount := min(pm.workers, len(candidates))
+	jobs := make(chan string, workerCount*2)
+
+	// Periodic telemetry logger every 5 seconds
+	tickerDone := make(chan struct{})
+	go func() {
+		defer close(tickerDone)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-ticker.C:
+				log.Printf("INFO - Proxy validation progress: %s", stats.snapshotString())
+			}
 		}
-		end := min(i+batchSize, len(candidates))
-		batch := candidates[i:end]
+	}()
 
-		pm.mu.Lock()
-		for _, p := range batch {
-			pm.testedSet[p] = struct{}{}
-		}
-		pm.mu.Unlock()
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for w := 0; w < workerCount; w++ {
+		go func() {
+			defer wg.Done()
+			discardBuf := make([]byte, 32*1024)
+			for proxyURL := range jobs {
+				if streamCtx.Err() != nil {
+					return
+				}
 
-		log.Printf("INFO - Validating batch of %d proxy candidates (%d workers)...", len(batch), pm.workers)
-		validNew := pm.validateBatch(ctx, batch)
-		pm.enqueueValidated(validNew)
+				pm.mu.Lock()
+				pm.testedSet[proxyURL] = struct{}{}
+				pm.mu.Unlock()
 
-		if len(validNew) > 0 {
-			log.Printf("INFO - Found %d high-speed proxies in batch (pool size: %d).", len(validNew), pm.Len())
-		}
+				stats.tested.Add(1)
+				speed, ok := pm.validateProxy(streamCtx, proxyURL, discardBuf, stats)
+				if !ok {
+					continue
+				}
 
-		if pm.Len() >= required {
-			log.Printf("INFO - Reached required number of working proxies (%d).", required)
-			break
+				stats.passed.Add(1)
+				vp := validatedProxy{
+					URL:        proxyURL,
+					SpeedBps:   speed,
+					LastTested: time.Now(),
+				}
+
+				pm.mu.Lock()
+				pm.verified[proxyURL] = vp
+				pm.pushLocked(proxyURL)
+				currentPoolSize := len(pm.queue)
+				pm.mu.Unlock()
+
+				log.Printf("INFO - Verified high-speed proxy %s (%.2f MB/s) [pool: %d]",
+					proxyURL, speed/(1024*1024), currentPoolSize)
+
+				if targetPoolSize > 0 && currentPoolSize >= targetPoolSize {
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+
+feeder:
+	for _, c := range candidates {
+		select {
+		case jobs <- c:
+		case <-streamCtx.Done():
+			break feeder
 		}
 	}
+	close(jobs)
+	wg.Wait()
+	cancel()
+	<-tickerDone
 }
 
 // SaveProxies atomically writes all currently verified working proxies (fastest first) to disk.
@@ -405,7 +506,7 @@ func (pm *ProxyManager) loadPersistedProxies() []string {
 	return proxies
 }
 
-func (pm *ProxyManager) nextCandidateBatchPool(ctx context.Context) []string {
+func (pm *ProxyManager) nextCandidatePool(ctx context.Context) []string {
 	pm.mu.Lock()
 	var untested []string
 	for _, p := range pm.cachedPool {
@@ -434,13 +535,10 @@ func (pm *ProxyManager) nextCandidateBatchPool(ctx context.Context) []string {
 func (pm *ProxyManager) fetchAllSources(ctx context.Context) []string {
 	log.Printf("INFO - Fetching proxies concurrently from %d sources...", len(pm.sources))
 
-	type sourceResult struct {
-		proxies []string
-	}
-	resultsCh := make(chan sourceResult, len(pm.sources))
-
+	resultsCh := make(chan []string, len(pm.sources))
 	var wg sync.WaitGroup
 	wg.Add(len(pm.sources))
+
 	for _, src := range pm.sources {
 		go func(s ProxySource) {
 			defer wg.Done()
@@ -468,7 +566,10 @@ func (pm *ProxyManager) fetchAllSources(ctx context.Context) []string {
 					local = append(local, norm)
 				}
 			}
-			resultsCh <- sourceResult{proxies: local}
+			rand.Shuffle(len(local), func(i, j int) {
+				local[i], local[j] = local[j], local[i]
+			})
+			resultsCh <- local
 		}(src)
 	}
 
@@ -477,113 +578,61 @@ func (pm *ProxyManager) fetchAllSources(ctx context.Context) []string {
 		close(resultsCh)
 	}()
 
-	seen := make(map[string]struct{})
-	var aggregated []string
+	var buckets [][]string
 	totalRaw := 0
-
-	for res := range resultsCh {
-		totalRaw += len(res.proxies)
-		for _, p := range res.proxies {
-			if _, exists := seen[p]; !exists {
-				seen[p] = struct{}{}
-				aggregated = append(aggregated, p)
-			}
+	for list := range resultsCh {
+		if len(list) > 0 {
+			totalRaw += len(list)
+			buckets = append(buckets, list)
 		}
 	}
 
-	// Shuffle aggregated pool so batch testing spans across all sources/IP ranges evenly
-	rand.Shuffle(len(aggregated), func(i, j int) {
-		aggregated[i], aggregated[j] = aggregated[j], aggregated[i]
+	// Sort smaller/curated buckets first so round-robin hits fresh sources immediately
+	sort.Slice(buckets, func(i, j int) bool {
+		return len(buckets[i]) < len(buckets[j])
 	})
+
+	// Round-robin interleave and deduplicate across all source buckets
+	seen := make(map[string]struct{}, totalRaw)
+	aggregated := make([]string, 0, totalRaw)
+	for pos := 0; ; pos++ {
+		addedInRound := false
+		for _, b := range buckets {
+			if pos < len(b) {
+				addedInRound = true
+				p := b[pos]
+				if _, exists := seen[p]; !exists {
+					seen[p] = struct{}{}
+					aggregated = append(aggregated, p)
+				}
+			}
+		}
+		if !addedInRound {
+			break
+		}
+	}
 
 	log.Printf("INFO - Collected %d proxies (%d unique after deduplication).", totalRaw, len(aggregated))
 	return aggregated
 }
 
-func (pm *ProxyManager) enqueueValidated(list []validatedProxy) {
-	if len(list) == 0 {
-		return
-	}
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].SpeedBps > list[j].SpeedBps
-	})
-	pm.mu.Lock()
-	for _, vp := range list {
-		pm.verified[vp.URL] = vp
-		pm.pushLocked(vp.URL)
-	}
-	pm.mu.Unlock()
-}
-
-func (pm *ProxyManager) validateBatch(ctx context.Context, candidates []string) []validatedProxy {
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	workerCount := min(pm.workers, len(candidates))
-	jobs := make(chan string)
-	results := make(chan validatedProxy, len(candidates))
-
-	var wg sync.WaitGroup
-	wg.Add(workerCount)
-	for w := 0; w < workerCount; w++ {
-		go func() {
-			defer wg.Done()
-			discardBuf := make([]byte, 32*1024)
-			for proxyURL := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				if speed, ok := pm.validateProxy(ctx, proxyURL, discardBuf); ok {
-					results <- validatedProxy{
-						URL:        proxyURL,
-						SpeedBps:   speed,
-						LastTested: time.Now(),
-					}
-				}
-			}
-		}()
-	}
-
-	go func() {
-		for _, c := range candidates {
-			select {
-			case jobs <- c:
-			case <-ctx.Done():
-				close(jobs)
-				wg.Wait()
-				close(results)
-				return
-			}
-		}
-		close(jobs)
-		wg.Wait()
-		close(results)
-	}()
-
-	var valid []validatedProxy
-	for vp := range results {
-		valid = append(valid, vp)
-	}
-	return valid
-}
-
-func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, discardBuf []byte) (float64, bool) {
+func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, discardBuf []byte, stats *validationStats) (float64, bool) {
 	parsedProxy, err := url.Parse(proxyURL)
 	if err != nil || parsedProxy.Host == "" {
 		return 0, false
 	}
 
-	// Stage 1: Fast TCP connectivity pre-check to drop dead IPs before allocating TLS sessions.
-	tcpTimeout := min(pm.timeout, 3*time.Second)
+	// Stage 1: Fast 1.5s TCP connectivity check (a >= 1.5 MB/s proxy must connect rapidly).
+	tcpTimeout := min(pm.timeout, fastTCPDialTimeout)
 	dialer := net.Dialer{Timeout: tcpTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", parsedProxy.Host)
 	if err != nil {
 		return 0, false
 	}
 	_ = conn.Close()
+	stats.tcpOK.Add(1)
 
-	// Stage 2: Full Chrome 120 TLS validation & speed benchmark strictly against pornhub.com.
+	// Stage 2: Chrome 120 TLS validation & download speed check against pornhub.com.
 	timeoutSec := max(int(pm.timeout.Seconds()), 1)
 	client, err := tls_client.NewHttpClient(
 		tls_client.NewNoopLogger(),
@@ -602,6 +651,10 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 	)
 
 	for idx, target := range pornhubProbeTargets {
+		if ctx.Err() != nil {
+			return 0, false
+		}
+
 		reqCtx, cancel := context.WithTimeout(ctx, pm.timeout)
 		req, reqErr := fhttp.NewRequestWithContext(reqCtx, fhttp.MethodGet, target, nil)
 		if reqErr != nil {
@@ -609,7 +662,6 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 			return 0, false
 		}
 
-		// Explicitly request uncompressed content so body bytes match actual wire throughput.
 		req.Header = fhttp.Header{
 			"accept":                    {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
 			"accept-encoding":           {"identity"},
@@ -623,6 +675,20 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 			"sec-fetch-user":            {"?1"},
 			"upgrade-insecure-requests": {"1"},
 			"user-agent":                {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+			fhttp.HeaderOrderKey: {
+				"sec-ch-ua",
+				"sec-ch-ua-mobile",
+				"sec-ch-ua-platform",
+				"upgrade-insecure-requests",
+				"user-agent",
+				"accept",
+				"sec-fetch-site",
+				"sec-fetch-mode",
+				"sec-fetch-user",
+				"sec-fetch-dest",
+				"accept-encoding",
+				"accept-language",
+			},
 		}
 
 		reqStart := time.Now()
@@ -641,6 +707,7 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 
 		bodyStart := time.Now()
 		if idx == 0 {
+			stats.http200.Add(1)
 			rawBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProbeReadBytes))
 			bodyDur := time.Since(bodyStart)
 			contentEnc := strings.ToLower(resp.Header.Get("Content-Encoding"))
@@ -652,10 +719,10 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 			}
 
 			htmlText := decodeBodyForInspection(rawBody, contentEnc)
-			if strings.Contains(htmlText, "Just a moment") || strings.Contains(htmlText, "Attention Required") {
-				return 0, false
-			}
-			if !strings.Contains(strings.ToLower(htmlText), "pornhub") {
+			if strings.Contains(htmlText, "Just a moment") ||
+				strings.Contains(htmlText, "Attention Required") ||
+				!strings.Contains(strings.ToLower(htmlText), "pornhub") {
+				stats.cfOrInvalid.Add(1)
 				return 0, false
 			}
 
@@ -680,11 +747,14 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 	}
 
 	if totalBytes < minValidSampleBytes || totalBodyDur <= 0 {
+		stats.tooSmall.Add(1)
 		return 0, false
 	}
 
 	speedBps := float64(totalBytes) / totalBodyDur.Seconds()
+	stats.recordBestSpeed(speedBps)
 	if speedBps < pm.minSpeedBytesPerSec {
+		stats.tooSlow.Add(1)
 		return speedBps, false
 	}
 	return speedBps, true
@@ -708,7 +778,6 @@ func normalizeProxyLine(raw string, defaultScheme string) (string, bool) {
 	if line == "" || strings.HasPrefix(line, "#") {
 		return "", false
 	}
-	// Strip inline comments or trailing metadata if present in some feeds
 	if fields := strings.Fields(line); len(fields) > 0 {
 		line = fields[0]
 	}
