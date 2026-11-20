@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"video-downloader/scrap"
+	"video-downloader/script"
 )
 
 // ------------------------------------------------------------------------------
@@ -29,21 +30,21 @@ import (
 // ------------------------------------------------------------------------------
 
 type Config struct {
-	ProxySources            []string          `json:"proxy_sources"`
-	ProxyValidationTimeout  int               `json:"proxy_validation_timeout"`
-	ProxyMaxLatencySeconds  float64           `json:"proxy_max_latency_seconds"`
-	ProxyValidationWorkers  int               `json:"proxy_validation_workers"`
-	ProxyBatchSize          int               `json:"proxy_batch_size"`
-	ConcurrentDownloads     int               `json:"concurrent_downloads"`
-	MaxRetriesPerVideo      int               `json:"max_retries_per_video"`
-	ChunkSizeBytes          int64             `json:"chunk_size_bytes"`
-	UserAgent               string            `json:"user_agent"`
-	DownloadHeaders         map[string]string `json:"download_headers"`
-	TempDir                 string            `json:"temp_dir"`
-	ValidProxiesFile        string            `json:"valid_proxies_file"`
-	URLsFile                string            `json:"urls_file"`
-	NoPreviewImageURL       string            `json:"no_preview_image_url"`
-	NoAvatarImageURL        string            `json:"no_avatar_image_url"`
+	ProxySources           []string          `json:"proxy_sources"`
+	ProxyValidationTimeout int               `json:"proxy_validation_timeout"`
+	ProxyMaxLatencySeconds float64           `json:"proxy_max_latency_seconds"`
+	ProxyValidationWorkers int               `json:"proxy_validation_workers"`
+	ProxyMinSpeedMBps      float64           `json:"proxy_min_speed_mbps"`
+	ConcurrentDownloads    int               `json:"concurrent_downloads"`
+	MaxRetriesPerVideo     int               `json:"max_retries_per_video"`
+	ChunkSizeBytes         int64             `json:"chunk_size_bytes"`
+	UserAgent              string            `json:"user_agent"`
+	DownloadHeaders        map[string]string `json:"download_headers"`
+	TempDir                string            `json:"temp_dir"`
+	ValidProxiesFile       string            `json:"valid_proxies_file"`
+	URLsFile               string            `json:"urls_file"`
+	NoPreviewImageURL      string            `json:"no_preview_image_url"`
+	NoAvatarImageURL       string            `json:"no_avatar_image_url"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -56,15 +57,6 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse %s: %w", path, err)
 	}
 
-	if cfg.ProxyValidationTimeout <= 0 {
-		cfg.ProxyValidationTimeout = 15
-	}
-	if cfg.ProxyMaxLatencySeconds <= 0 {
-		cfg.ProxyMaxLatencySeconds = 20.0
-	}
-	if cfg.ProxyValidationWorkers <= 0 {
-		cfg.ProxyValidationWorkers = 50
-	}
 	if cfg.ConcurrentDownloads <= 0 {
 		cfg.ConcurrentDownloads = 5
 	}
@@ -212,22 +204,6 @@ func formatPublishDate(publishDate *time.Time) string {
 // Image Download
 // ------------------------------------------------------------------------------
 
-func normalizeProxyURL(proxy string) (string, bool) {
-	p := strings.TrimSpace(proxy)
-	if p == "" {
-		return "", false
-	}
-	if strings.HasPrefix(p, "socks5://") ||
-		strings.HasPrefix(p, "http://") ||
-		strings.HasPrefix(p, "https://") {
-		return p, true
-	}
-	if !strings.Contains(p, "://") {
-		return "http://" + p, true
-	}
-	return "", false
-}
-
 func downloadImage(ctx context.Context, imgURL string, outputPath string, proxy string) bool {
 	if imgURL == "" {
 		return false
@@ -242,10 +218,8 @@ func downloadImage(ctx context.Context, imgURL string, outputPath string, proxy 
 		DisableKeepAlives:   true,
 	}
 	if proxy != "" {
-		if norm, ok := normalizeProxyURL(proxy); ok {
-			if parsedProxy, err := url.Parse(norm); err == nil {
-				transport.Proxy = http.ProxyURL(parsedProxy)
-			}
+		if parsedProxy, err := url.Parse(proxy); err == nil {
+			transport.Proxy = http.ProxyURL(parsedProxy)
 		}
 	}
 	defer transport.CloseIdleConnections()
@@ -284,7 +258,6 @@ func downloadImage(ctx context.Context, imgURL string, outputPath string, proxy 
 				status := resp.StatusCode
 				_, _ = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-				// Retry only on 500, 502, 503, 504 matching urllib3 Retry config
 				if status != 500 && status != 502 && status != 503 && status != 504 {
 					log.Printf("WARNING - Failed to download image from %s to %s: HTTP %d", imgURL, outputPath, status)
 					return false
@@ -298,7 +271,6 @@ func downloadImage(ctx context.Context, imgURL string, outputPath string, proxy 
 			return false
 		}
 
-		// Exponential backoff: 0.5s, 1.0s, 2.0s
 		backoff := time.Duration(500<<attempt) * time.Millisecond
 		timer := time.NewTimer(backoff)
 		select {
@@ -312,346 +284,10 @@ func downloadImage(ctx context.Context, imgURL string, outputPath string, proxy 
 }
 
 // ------------------------------------------------------------------------------
-// Highly Optimized Proxy Management
-// ------------------------------------------------------------------------------
-
-func validateProxy(ctx context.Context, proxy string, timeout time.Duration, maxLatency time.Duration) bool {
-	normProxy, ok := normalizeProxyURL(proxy)
-	if !ok {
-		return false
-	}
-	parsedProxy, err := url.Parse(normProxy)
-	if err != nil {
-		return false
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	transport := &http.Transport{
-		Proxy:               http.ProxyURL(parsedProxy),
-		DialContext:         (&net.Dialer{Timeout: timeout}).DialContext,
-		TLSHandshakeTimeout: timeout,
-		DisableKeepAlives:   true,
-	}
-	defer transport.CloseIdleConnections()
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-	}
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://checkip.amazonaws.com", nil)
-	if err != nil {
-		return false
-	}
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	// Read at most 256 bytes to discard oversized captive-portal pages immediately.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256))
-	if err != nil {
-		return false
-	}
-	elapsed := time.Since(start)
-
-	text := strings.TrimSpace(string(raw))
-	isValidIP := (strings.Contains(text, ".") || strings.Contains(text, ":")) && len(text) < 50
-	return isValidIP && elapsed <= maxLatency
-}
-
-func validateProxiesParallel(ctx context.Context, candidates []string, timeout time.Duration, maxLatency time.Duration, maxWorkers int) []string {
-	if len(candidates) == 0 {
-		return nil
-	}
-	if maxWorkers <= 0 {
-		maxWorkers = 50
-	}
-	if maxWorkers > len(candidates) {
-		maxWorkers = len(candidates)
-	}
-
-	jobs := make(chan string)
-	results := make(chan string, len(candidates))
-
-	var wg sync.WaitGroup
-	wg.Add(maxWorkers)
-	for w := 0; w < maxWorkers; w++ {
-		go func() {
-			defer wg.Done()
-			for p := range jobs {
-				if validateProxy(ctx, p, timeout, maxLatency) {
-					results <- p
-				}
-			}
-		}()
-	}
-
-	go func() {
-		for _, c := range candidates {
-			jobs <- c
-		}
-		close(jobs)
-		wg.Wait()
-		close(results)
-	}()
-
-	seen := make(map[string]struct{})
-	var valid []string
-	for p := range results {
-		if _, exists := seen[p]; !exists {
-			seen[p] = struct{}{}
-			valid = append(valid, p)
-		}
-	}
-	return valid
-}
-
-type ProxyManager struct {
-	config           *Config
-	validProxiesFile string
-	timeout          time.Duration
-	maxLatency       time.Duration
-	workers          int
-	httpClient       *http.Client
-
-	mu           sync.Mutex
-	queue        []string
-	notEmpty     chan struct{}
-	replenishing bool
-	replenishCh  chan struct{}
-}
-
-func NewProxyManager(cfg *Config) *ProxyManager {
-	return &ProxyManager{
-		config:           cfg,
-		validProxiesFile: cfg.ValidProxiesFile,
-		timeout:          time.Duration(cfg.ProxyValidationTimeout) * time.Second,
-		maxLatency:       time.Duration(cfg.ProxyMaxLatencySeconds * float64(time.Second)),
-		workers:          cfg.ProxyValidationWorkers,
-		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        20,
-				IdleConnTimeout:     30 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-			},
-		},
-		notEmpty: make(chan struct{}),
-	}
-}
-
-func (pm *ProxyManager) push(proxy string) {
-	pm.mu.Lock()
-	wasEmpty := len(pm.queue) == 0
-	pm.queue = append(pm.queue, proxy)
-	if wasEmpty {
-		close(pm.notEmpty)
-		pm.notEmpty = make(chan struct{})
-	}
-	pm.mu.Unlock()
-}
-
-func (pm *ProxyManager) Len() int {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	return len(pm.queue)
-}
-
-func (pm *ProxyManager) IsEmpty() bool {
-	return pm.Len() == 0
-}
-
-func (pm *ProxyManager) GetProxy(ctx context.Context, timeout time.Duration) (string, bool) {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-
-	for {
-		pm.mu.Lock()
-		if len(pm.queue) > 0 {
-			p := pm.queue[0]
-			// Zero out reference for GC and pop
-			pm.queue[0] = ""
-			pm.queue = pm.queue[1:]
-			pm.mu.Unlock()
-			return p, true
-		}
-		waitCh := pm.notEmpty
-		pm.mu.Unlock()
-
-		select {
-		case <-waitCh:
-			continue
-		case <-deadline.C:
-			return "", false
-		case <-ctx.Done():
-			return "", false
-		}
-	}
-}
-
-func (pm *ProxyManager) ReportResult(proxy string, success bool) {
-	if success && proxy != "" {
-		pm.push(proxy)
-	}
-}
-
-func (pm *ProxyManager) fetchFromSources(ctx context.Context) []string {
-	sources := pm.config.ProxySources
-	if len(sources) == 0 {
-		return nil
-	}
-
-	var (
-		mu      sync.Mutex
-		wg      sync.WaitGroup
-		seen    = make(map[string]struct{})
-		fetched []string
-	)
-
-	wg.Add(len(sources))
-	for _, srcURL := range sources {
-		go func(u string) {
-			defer wg.Done()
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-			if err != nil {
-				log.Printf("WARNING - Failed to fetch proxies from %s: %v", u, err)
-				return
-			}
-			resp, err := pm.httpClient.Do(req)
-			if err != nil {
-				log.Printf("WARNING - Failed to fetch proxies from %s: %v", u, err)
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				return
-			}
-
-			var local []string
-			scanner := bufio.NewScanner(resp.Body)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line != "" && !strings.HasPrefix(line, "#") {
-					local = append(local, line)
-				}
-			}
-
-			mu.Lock()
-			for _, p := range local {
-				if _, ok := seen[p]; !ok {
-					seen[p] = struct{}{}
-					fetched = append(fetched, p)
-				}
-			}
-			mu.Unlock()
-		}(srcURL)
-	}
-	wg.Wait()
-	return fetched
-}
-
-func (pm *ProxyManager) Replenish(ctx context.Context, required int) {
-	pm.mu.Lock()
-	if len(pm.queue) >= required {
-		pm.mu.Unlock()
-		return
-	}
-	if pm.replenishing {
-		waitCh := pm.replenishCh
-		pm.mu.Unlock()
-		select {
-		case <-waitCh:
-		case <-ctx.Done():
-		}
-		return
-	}
-	pm.replenishing = true
-	pm.replenishCh = make(chan struct{})
-	pm.mu.Unlock()
-
-	defer func() {
-		pm.mu.Lock()
-		pm.replenishing = false
-		close(pm.replenishCh)
-		pm.mu.Unlock()
-	}()
-
-	log.Printf("INFO - Replenishing proxies. Aiming for at least %d working proxies...", required)
-	validSet := make(map[string]struct{})
-
-	// 1. Load and test persisted proxies first
-	if raw, err := os.ReadFile(pm.validProxiesFile); err == nil {
-		var persisted []string
-		scanner := bufio.NewScanner(bytes.NewReader(raw))
-		for scanner.Scan() {
-			if line := strings.TrimSpace(scanner.Text()); line != "" {
-				persisted = append(persisted, line)
-			}
-		}
-		if len(persisted) > 0 {
-			log.Printf("INFO - Validating %d persisted proxies...", len(persisted))
-			validPersisted := validateProxiesParallel(ctx, persisted, pm.timeout, pm.maxLatency, pm.workers)
-			for _, p := range validPersisted {
-				validSet[p] = struct{}{}
-				pm.push(p)
-			}
-		}
-	}
-
-	// 2. Fetch new online proxies if still short
-	needed := required - pm.Len()
-	if needed > 0 {
-		log.Printf("INFO - Still need %d proxies. Fetching from online sources...", needed)
-		fetched := pm.fetchFromSources(ctx)
-		newCandidates := make([]string, 0, len(fetched))
-		for _, p := range fetched {
-			if _, exists := validSet[p]; !exists {
-				newCandidates = append(newCandidates, p)
-			}
-		}
-
-		if len(newCandidates) > 0 {
-			batchSize := max(needed*4, 150)
-			for i := 0; i < len(newCandidates); i += batchSize {
-				end := min(i+batchSize, len(newCandidates))
-				batch := newCandidates[i:end]
-				log.Printf("INFO - Validating batch of %d proxy candidates...", len(batch))
-
-				validNew := validateProxiesParallel(ctx, batch, pm.timeout, pm.maxLatency, pm.workers)
-				for _, p := range validNew {
-					validSet[p] = struct{}{}
-					pm.push(p)
-				}
-
-				if pm.Len() >= required {
-					log.Printf("INFO - Reached required number of working proxies.")
-					break
-				} else if end < len(newCandidates) {
-					log.Printf("INFO - Still short of proxies. Testing next batch...")
-				}
-			}
-		} else {
-			log.Printf("ERROR - No new proxies could be fetched from any source.")
-		}
-	}
-}
-
-// ------------------------------------------------------------------------------
 // Dynamic Metadata Fetching Wrapper
 // ------------------------------------------------------------------------------
 
-func fetchMetadataWithRotation(ctx context.Context, videoURL string, pm *ProxyManager, cfg *Config) (*FullMetadata, string) {
+func fetchMetadataWithRotation(ctx context.Context, videoURL string, pm *script.ProxyManager, cfg *Config) (*FullMetadata, string) {
 	retries := cfg.MaxRetriesPerVideo
 
 	for attempt := 1; attempt <= retries; attempt++ {
@@ -700,7 +336,7 @@ func fetchMetadataWithRotation(ctx context.Context, videoURL string, pm *ProxyMa
 	return nil, ""
 }
 
-func fetchAllMetadata(ctx context.Context, urls []string, pm *ProxyManager, cfg *Config, maxWorkers int) []metadataResult {
+func fetchAllMetadata(ctx context.Context, urls []string, pm *script.ProxyManager, cfg *Config, maxWorkers int) []metadataResult {
 	if len(urls) == 0 {
 		return nil
 	}
@@ -751,18 +387,11 @@ func fetchAllMetadata(ctx context.Context, urls []string, pm *ProxyManager, cfg 
 // ------------------------------------------------------------------------------
 
 func downloadVideo(ctx context.Context, videoURL string, videoID string, outputPath string, proxy string, cfg *Config) bool {
-	proxyArg := proxy
-	if !strings.HasPrefix(proxy, "socks5://") &&
-		!strings.HasPrefix(proxy, "http://") &&
-		!strings.HasPrefix(proxy, "https://") {
-		proxyArg = "http://" + proxy
-	}
-
 	args := []string{
 		videoURL,
 		"--no-playlist",
 		"--impersonate", "Chrome-100",
-		"--proxy", proxyArg,
+		"--proxy", proxy,
 		"--format", "bestvideo+bestaudio/best",
 		"--merge-output-format", "mkv",
 		"--output", filepath.Join(outputPath, fmt.Sprintf("%s.%%(ext)s", videoID)),
@@ -921,7 +550,7 @@ func downloadAndSplit(
 	ctx context.Context,
 	videoURL string,
 	metadata *FullMetadata,
-	pm *ProxyManager,
+	pm *script.ProxyManager,
 	cfg *Config,
 	tempDir string,
 	preferredProxy string,
@@ -998,7 +627,6 @@ func downloadAndSplit(
 		return false
 	}
 
-	// Download thumbnail and avatar concurrently
 	var assetWG sync.WaitGroup
 	thumbnailFilename := "preview.png"
 	previewPath := filepath.Join(folderName, thumbnailFilename)
@@ -1204,11 +832,18 @@ func main() {
 	}
 
 	// ---------------------------------------------------
-	// 2. Acquire Proxies
+	// 2. Acquire & Validate Proxies via script/proxy.go
 	// ---------------------------------------------------
-	pm := NewProxyManager(cfg)
-	requiredProxies := len(videoURLs) * 2
+	pm := script.NewProxyManager(script.ProxyConfig{
+		ExtraSources:      cfg.ProxySources,
+		ValidProxiesFile:  cfg.ValidProxiesFile,
+		ValidationTimeout: time.Duration(cfg.ProxyValidationTimeout) * time.Second,
+		MaxLatency:        time.Duration(cfg.ProxyMaxLatencySeconds * float64(time.Second)),
+		Workers:           cfg.ProxyValidationWorkers,
+		MinSpeedMBps:      cfg.ProxyMinSpeedMBps,
+	})
 
+	requiredProxies := len(videoURLs) * 2
 	log.Printf("INFO - Acquiring working proxies for %d new videos upfront...", len(videoURLs))
 	pm.Replenish(ctx, requiredProxies)
 
@@ -1222,6 +857,7 @@ func main() {
 	log.Printf("INFO - Fetching metadata for %d videos dynamically rotating through proxies...", len(videoURLs))
 	videosMetadataTuples := fetchAllMetadata(ctx, videoURLs, pm, cfg, cfg.ConcurrentDownloads)
 	if len(videosMetadataTuples) == 0 {
+		_ = pm.SaveProxies()
 		log.Fatalf("FATAL - Failed to fetch metadata for any video. Exiting.")
 	}
 
@@ -1271,6 +907,11 @@ func main() {
 		}
 		close(jobs)
 		wg.Wait()
+	}
+
+	// Persist verified working proxies after video processing (prior to git commit/push).
+	if err := pm.SaveProxies(); err != nil {
+		log.Printf("WARNING - Failed to save validated proxies: %v", err)
 	}
 
 	if len(successIDs) == 0 {
