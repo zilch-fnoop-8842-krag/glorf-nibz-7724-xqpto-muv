@@ -10,7 +10,7 @@
   "proxy_validation_timeout": 8,
   "proxy_max_latency_seconds": 8.0,
   "proxy_batch_size": 100,
-  "proxy_min_speed_mbps": 2,
+  "proxy_min_speed_mbps": 1.6,
   "concurrent_downloads": 1,
   "max_retries_per_video": 5,
   "chunk_size_bytes": 99614720,
