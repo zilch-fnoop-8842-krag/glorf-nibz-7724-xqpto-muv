@@ -394,12 +394,14 @@ func (c *HTTPClient) doGet(ctx context.Context, targetURL string) (string, error
 		return "", fmt.Errorf("%w: HTTP session is closed", ErrScraping)
 	}
 
-	req, err := fhttp.NewRequestWithContext(ctx, fhttp.MethodGet, targetURL, nil)
+	reqCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	defer cancel()
+
+	req, err := fhttp.NewRequestWithContext(reqCtx, fhttp.MethodGet, targetURL, nil)
 	if err != nil {
 		return "", err
 	}
 
-	// Emulate curl_cffi chrome120 default navigation headers
 	req.Header = fhttp.Header{
 		"accept":                    {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
 		"accept-language":           {"en-US,en;q=0.9"},
@@ -427,32 +429,50 @@ func (c *HTTPClient) doGet(ctx context.Context, targetURL string) (string, error
 		},
 	}
 
-	resp, err := session.Do(req)
-	if err != nil {
-		return "", err
+	type fetchOutcome struct {
+		body string
+		err  error
 	}
-	defer resp.Body.Close()
+	resCh := make(chan fetchOutcome, 1)
 
-	if resp.StatusCode == 429 {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return "", fmt.Errorf("%w: HTTP 429 Too Many Requests", ErrRateLimit)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return "", fmt.Errorf("HTTP error status %d", resp.StatusCode)
-	}
+	go func() {
+		resp, doErr := session.Do(req)
+		if doErr != nil {
+			resCh <- fetchOutcome{err: doErr}
+			return
+		}
+		defer resp.Body.Close()
 
-	rawBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	body := string(rawBytes)
+		if resp.StatusCode == 429 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resCh <- fetchOutcome{err: fmt.Errorf("%w: HTTP 429 Too Many Requests", ErrRateLimit)}
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resCh <- fetchOutcome{err: fmt.Errorf("HTTP error status %d", resp.StatusCode)}
+			return
+		}
 
-	if strings.Contains(body, "Just a moment") || strings.Contains(body, "Attention Required") {
-		return "", ErrCloudflareBlock
-	}
+		rawBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			resCh <- fetchOutcome{err: readErr}
+			return
+		}
+		body := string(rawBytes)
+		if strings.Contains(body, "Just a moment") || strings.Contains(body, "Attention Required") {
+			resCh <- fetchOutcome{err: ErrCloudflareBlock}
+			return
+		}
+		resCh <- fetchOutcome{body: body}
+	}()
 
-	return body, nil
+	select {
+	case out := <-resCh:
+		return out.body, out.err
+	case <-reqCtx.Done():
+		return "", fmt.Errorf("request timed out or canceled: %w", reqCtx.Err())
+	}
 }
 
 // ==========================================
