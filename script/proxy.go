@@ -319,7 +319,7 @@ func (pm *ProxyManager) Replenish(ctx context.Context, required int) {
 		if len(persisted) > 0 {
 			log.Printf("INFO - Re-validating %d persisted proxies against pornhub.com...", len(persisted))
 			stats := &validationStats{}
-			pm.validateStream(ctx, persisted, 0, stats) // 0 = validate all persisted proxies
+			pm.validateStream(ctx, persisted, 0, stats)
 			log.Printf("INFO - Persisted proxy check summary: %s", stats.snapshotString())
 		}
 	}
@@ -356,7 +356,6 @@ func (pm *ProxyManager) validateStream(ctx context.Context, candidates []string,
 	workerCount := min(pm.workers, len(candidates))
 	jobs := make(chan string, workerCount*2)
 
-	// Periodic telemetry logger every 5 seconds
 	tickerDone := make(chan struct{})
 	go func() {
 		defer close(tickerDone)
@@ -377,7 +376,6 @@ func (pm *ProxyManager) validateStream(ctx context.Context, candidates []string,
 	for w := 0; w < workerCount; w++ {
 		go func() {
 			defer wg.Done()
-			discardBuf := make([]byte, 32*1024)
 			for proxyURL := range jobs {
 				if streamCtx.Err() != nil {
 					return
@@ -388,7 +386,7 @@ func (pm *ProxyManager) validateStream(ctx context.Context, candidates []string,
 				pm.mu.Unlock()
 
 				stats.tested.Add(1)
-				speed, ok := pm.validateProxy(streamCtx, proxyURL, discardBuf, stats)
+				speed, ok := pm.validateProxy(streamCtx, proxyURL, stats)
 				if !ok {
 					continue
 				}
@@ -587,12 +585,10 @@ func (pm *ProxyManager) fetchAllSources(ctx context.Context) []string {
 		}
 	}
 
-	// Sort smaller/curated buckets first so round-robin hits fresh sources immediately
 	sort.Slice(buckets, func(i, j int) bool {
 		return len(buckets[i]) < len(buckets[j])
 	})
 
-	// Round-robin interleave and deduplicate across all source buckets
 	seen := make(map[string]struct{}, totalRaw)
 	aggregated := make([]string, 0, totalRaw)
 	for pos := 0; ; pos++ {
@@ -616,13 +612,13 @@ func (pm *ProxyManager) fetchAllSources(ctx context.Context) []string {
 	return aggregated
 }
 
-func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, discardBuf []byte, stats *validationStats) (float64, bool) {
+func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, stats *validationStats) (float64, bool) {
 	parsedProxy, err := url.Parse(proxyURL)
 	if err != nil || parsedProxy.Host == "" {
 		return 0, false
 	}
 
-	// Stage 1: Fast 1.5s TCP connectivity check (a >= 1.5 MB/s proxy must connect rapidly).
+	// Stage 1: Fast 1.5s TCP connectivity check.
 	tcpTimeout := min(pm.timeout, fastTCPDialTimeout)
 	dialer := net.Dialer{Timeout: tcpTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", parsedProxy.Host)
@@ -632,7 +628,31 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 	_ = conn.Close()
 	stats.tcpOK.Add(1)
 
-	// Stage 2: Chrome 120 TLS validation & download speed check against pornhub.com.
+	// Stage 2: Hard-deadline watchdog around tls-client so blackholed TLS handshakes
+	// or context cancellation never stall worker shutdown.
+	probeBudget := max(pm.timeout*2, 12*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(ctx, probeBudget)
+	defer probeCancel()
+
+	type probeOutcome struct {
+		speed float64
+		ok    bool
+	}
+	resCh := make(chan probeOutcome, 1)
+	go func() {
+		spd, valid := pm.probePornhubTLS(probeCtx, proxyURL, stats)
+		resCh <- probeOutcome{speed: spd, ok: valid}
+	}()
+
+	select {
+	case out := <-resCh:
+		return out.speed, out.ok
+	case <-probeCtx.Done():
+		return 0, false
+	}
+}
+
+func (pm *ProxyManager) probePornhubTLS(ctx context.Context, proxyURL string, stats *validationStats) (float64, bool) {
 	timeoutSec := max(int(pm.timeout.Seconds()), 1)
 	client, err := tls_client.NewHttpClient(
 		tls_client.NewNoopLogger(),
@@ -699,7 +719,7 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 		}
 
 		if resp.StatusCode != http.StatusOK || time.Since(reqStart) > pm.maxLatency {
-			_, _ = io.CopyBuffer(io.Discard, resp.Body, discardBuf)
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			cancel()
 			return 0, false
@@ -729,7 +749,7 @@ func (pm *ProxyManager) validateProxy(ctx context.Context, proxyURL string, disc
 			totalBytes += int64(len(rawBody))
 			totalBodyDur += bodyDur
 		} else {
-			written, copyErr := io.CopyBuffer(io.Discard, io.LimitReader(resp.Body, maxProbeReadBytes), discardBuf)
+			written, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeReadBytes))
 			bodyDur := time.Since(bodyStart)
 			_ = resp.Body.Close()
 			cancel()
