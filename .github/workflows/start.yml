@@ -1,0 +1,42 @@
+name: Video Downloader its crazy
+
+on:
+  workflow_dispatch:   # allow manual triggering
+
+concurrency:
+  group: video-download-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    if: github.actor != 'github-actions[bot]'   # prevent infinite loop from pushes by this bot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install yt-dlp
+        run: |
+          sudo curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+
+      - name: Build Go binary
+        run: go build -ldflags="-s -w" -o /tmp/video-downloader .
+
+      - name: Run main binary
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: /tmp/video-downloader
