@@ -15,11 +15,17 @@ jobs:
     if: github.actor != 'github-actions[bot]'   # prevent infinite loop from pushes by this bot
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (sparse, excludes VID_*)
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1              # shallow clone — no history
+          filter: blob:none           # partial clone — don't fetch blobs upfront
+          sparse-checkout: |
+            /*
+            !/VID_*
+          sparse-checkout-cone-mode: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
