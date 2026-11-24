@@ -20,12 +20,26 @@ jobs:
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1              # shallow clone — no history
-          filter: blob:none           # partial clone — don't fetch blobs upfront
+          fetch-depth: 1
+          filter: blob:none
           sparse-checkout: |
             /*
             !/VID_*
           sparse-checkout-cone-mode: false
+
+      - name: Install git wrapper (auto --sparse for git add)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/git" <<'WRAPPER'
+          #!/usr/bin/env bash
+          if [[ "$1" == "add" ]]; then
+            shift
+          exec /usr/bin/git add --sparse "$@"
+          fi
+          exec /usr/bin/git "$@"
+          WRAPPER
+          chmod +x "$HOME/.local/bin/git"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Set up Go
         uses: actions/setup-go@v5
